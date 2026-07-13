@@ -1,37 +1,46 @@
 use chrono::{DateTime, Local};
 use iced::Fill;
-use iced::widget::{column, row, scrollable, text};
+use iced::widget::text::Span;
+use iced::widget::{column, rich_text, scrollable};
 use uuid::Uuid;
 
 use super::Element;
 use crate::data::{Contact, Message, Status, contact_name};
+use crate::theme;
 
 pub fn view<'a, M: 'a>(messages: &'a [Message], aci: Uuid, contacts: &'a [Contact]) -> Element<'a, M> {
+    let colors = theme::colors();
     let rows = messages.iter().map(|message| {
         let own = message.sender == aci;
-        let mut item = row![
-            text(format_time(message.timestamp))
-                .size(12)
-                .style(text::secondary),
-            text(sender_name(message.sender, aci, contacts))
-                .size(14)
-                .style(if own { text::primary } else { text::success }),
-            text(&message.body).size(14),
-        ]
-        .spacing(8);
+        let sender_color = if own {
+            colors.text
+        } else {
+            theme::accent(message.sender.as_bytes())
+        };
+        let mut spans: Vec<Span<'a>> = vec![
+            Span::new(format_time(message.timestamp)).color(colors.muted),
+            Span::new(" "),
+            Span::new(sender_name(message.sender, aci, contacts))
+                .color(sender_color)
+                .font(theme::FONT_BOLD),
+            Span::new(": ").color(colors.muted),
+            Span::new(message.body.as_str()),
+        ];
         if let Some(status) = message.status {
-            item = item.push(text(status_label(status)).size(12).style(
-                if status == Status::Failed {
-                    text::danger
-                } else {
-                    text::secondary
-                },
-            ));
+            spans.push(
+                Span::new(format!("  {}", status_label(status)))
+                    .color(if status == Status::Failed {
+                        colors.danger
+                    } else {
+                        colors.muted
+                    })
+                    .size(11),
+            );
         }
-        item.into()
+        rich_text(spans).size(13).into()
     });
 
-    scrollable(column(rows).spacing(4).padding(8).width(Fill))
+    scrollable(column(rows).spacing(5).padding([10, 12]).width(Fill))
         .anchor_bottom()
         .height(Fill)
         .into()

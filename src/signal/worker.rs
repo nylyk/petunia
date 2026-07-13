@@ -6,6 +6,7 @@ use presage::Manager;
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::{Content, DataMessage, GroupContextV2, Metadata};
 use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::zkgroup::profiles::ProfileKey;
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, ContentsStore, StateStore};
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use super::status::StatusStore;
 use super::{Command, Error, Event, store};
-use crate::data::{self, Contact, Group, Thread};
+use crate::data::{self, Contact, ContactId, Group, Thread};
 
 type Events = mpsc::Sender<Event>;
 type RegisteredManager = Manager<SqliteStore, Registered>;
@@ -61,6 +62,8 @@ async fn serve(mut commands: UnboundedReceiver<Command>, mut events: Events) -> 
     if let Err(error) = send_contacts(&manager, &mut events).await {
         warn!(%error, "failed to load contacts");
     }
+    tokio::task::spawn_local(fetch_avatars(manager.clone(), events.clone()));
+    tokio::task::spawn_local(fetch_previews(manager.clone(), events.clone()));
     if freshly_linked
         && let Err(error) = manager.request_contacts().await
     {
@@ -182,6 +185,8 @@ async fn receive_once(
                 if let Err(error) = send_contacts(manager, events).await {
                     warn!(%error, "failed to load synced contacts");
                 }
+                tokio::task::spawn_local(fetch_avatars(manager.clone(), events.clone()));
+                tokio::task::spawn_local(fetch_previews(manager.clone(), events.clone()));
             }
             Received::Content(content) => {
                 debug!(timestamp = content.timestamp(), "received content");
@@ -331,6 +336,123 @@ async fn load_history(
         });
     }
     Ok(messages)
+}
+
+async fn fetch_avatars(mut manager: RegisteredManager, mut events: Events) {
+    let contacts = match manager.store().contacts().await {
+        Ok(contacts) => contacts.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) => {
+            warn!(%error, "failed to list contacts for avatars");
+            Vec::new()
+        }
+    };
+    for contact in contacts {
+        let thread = Thread::Contact(ContactId::Aci(contact.uuid));
+        let bytes = match &contact.avatar {
+            Some(avatar) => Some(avatar.reader.to_vec()),
+            None => fetch_profile_avatar(&mut manager, &contact).await,
+        };
+        if let Some(bytes) = bytes
+            && !bytes.is_empty()
+        {
+            emit(&mut events, Event::Avatar { thread, bytes }).await;
+        }
+    }
+
+    let groups = match manager.store().groups().await {
+        Ok(groups) => groups.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) => {
+            warn!(%error, "failed to list groups for avatars");
+            return;
+        }
+    };
+    for (master_key, group) in groups {
+        if group.avatar.is_empty() {
+            continue;
+        }
+        let context = GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(group.revision),
+            ..Default::default()
+        };
+        match manager.retrieve_group_avatar(context).await {
+            Ok(Some(bytes)) if !bytes.is_empty() => {
+                emit(
+                    &mut events,
+                    Event::Avatar {
+                        thread: Thread::Group(master_key),
+                        bytes,
+                    },
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, title = group.title, "failed to fetch group avatar"),
+        }
+    }
+}
+
+async fn fetch_previews(manager: RegisteredManager, mut events: Events) {
+    let threads = match sidebar_threads(&manager).await {
+        Ok(threads) => threads,
+        Err(error) => {
+            warn!(%error, "failed to list threads for previews");
+            return;
+        }
+    };
+    for thread in threads {
+        match last_message(&manager, &thread).await {
+            Ok(Some(message)) => emit(&mut events, Event::Preview { thread, message }).await,
+            Ok(None) => {}
+            Err(error) => warn!(%error, "failed to load last message"),
+        }
+    }
+}
+
+async fn sidebar_threads(manager: &RegisteredManager) -> Result<Vec<Thread>, Error> {
+    let store = manager.store();
+    let mut threads: Vec<Thread> = store
+        .contacts()
+        .await?
+        .filter_map(Result::ok)
+        .map(|contact| Thread::Contact(ContactId::Aci(contact.uuid)))
+        .collect();
+    threads.extend(
+        store
+            .groups()
+            .await?
+            .filter_map(Result::ok)
+            .map(|(master_key, _)| Thread::Group(master_key)),
+    );
+    Ok(threads)
+}
+
+async fn last_message(
+    manager: &RegisteredManager,
+    thread: &Thread,
+) -> Result<Option<data::Message>, Error> {
+    let messages = manager.store().messages(&thread.into(), ..).await?;
+    Ok(messages
+        .filter_map(Result::ok)
+        .filter_map(|content| data::from_content(&content).map(|(_, message)| message))
+        .max_by_key(|message| message.timestamp))
+}
+
+async fn fetch_profile_avatar(
+    manager: &mut RegisteredManager,
+    contact: &presage::model::contacts::Contact,
+) -> Option<Vec<u8>> {
+    let key: [u8; 32] = contact.profile_key.as_slice().try_into().ok()?;
+    match manager
+        .retrieve_profile_avatar_by_uuid(contact.uuid, ProfileKey::create(key))
+        .await
+    {
+        Ok(avatar) => avatar,
+        Err(error) => {
+            warn!(%error, uuid = %contact.uuid, "failed to fetch profile avatar");
+            None
+        }
+    }
 }
 
 async fn send_contacts(manager: &RegisteredManager, events: &mut Events) -> Result<(), Error> {

@@ -21,5 +21,6 @@ fn main() -> iced::Result {
         .title(Petunia::title)
         .subscription(Petunia::subscription)
         .theme(Petunia::theme)
+        .default_font(iced::Font::MONOSPACE)
         .run()
 }

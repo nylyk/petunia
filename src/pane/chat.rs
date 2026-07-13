@@ -1,7 +1,8 @@
-use iced::widget::{column, text_input};
+use iced::widget::{column, container, text_input};
 use uuid::Uuid;
 
 use crate::data::{self, Contact, Thread};
+use crate::theme;
 use crate::widget::{Element, message_view};
 
 #[derive(Debug, Clone)]
@@ -52,13 +53,19 @@ impl Chat {
         history: &'a [data::Message],
         aci: Uuid,
         contacts: &'a [Contact],
+        title: &str,
     ) -> Element<'a, Message> {
         column![
             message_view::view(history, aci, contacts),
-            text_input("Message", &self.input)
-                .on_input(Message::InputChanged)
-                .on_submit(Message::Submit)
-                .padding(8),
+            container(
+                text_input(&format!("Message {title}…"), &self.input)
+                    .on_input(Message::InputChanged)
+                    .on_submit(Message::Submit)
+                    .size(13)
+                    .padding([7, 10])
+                    .style(theme::message_input),
+            )
+            .padding(8),
         ]
         .into()
     }

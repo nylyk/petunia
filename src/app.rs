@@ -102,6 +102,16 @@ impl Petunia {
                     main.contacts_updated(contacts, groups);
                 }
             }
+            signal::Event::Avatar { thread, bytes } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    main.avatar_loaded(thread, bytes);
+                }
+            }
+            signal::Event::Preview { thread, message } => {
+                if let Screen::Main(main) = &mut self.screen {
+                    main.preview_loaded(thread, message);
+                }
+            }
             signal::Event::History { thread, messages } => {
                 if let Screen::Main(main) = &mut self.screen {
                     main.history_loaded(thread, messages);

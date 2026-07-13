@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::widget::pane_grid::{self, PaneGrid};
-use iced::widget::{button, column, container, row, text};
-use iced::{Fill, Shrink};
+use iced::widget::{button, column, container, image, row, text};
+use iced::{Center, Fill, Shrink};
 use uuid::Uuid;
 
 use crate::config;
@@ -10,7 +10,7 @@ use crate::data::{self, Contact, Group, Thread, contact_name};
 use crate::pane::{Pane, chat};
 use crate::signal;
 use crate::theme;
-use crate::widget::{Element, sidebar};
+use crate::widget::{Element, avatar, sidebar};
 
 pub struct Main {
     aci: Uuid,
@@ -18,6 +18,9 @@ pub struct Main {
     focus: pane_grid::Pane,
     contacts: Vec<Contact>,
     groups: Vec<Group>,
+    avatars: HashMap<Thread, image::Handle>,
+    previews: HashMap<Thread, data::Message>,
+    unread: HashMap<Thread, u32>,
     histories: HashMap<Thread, Vec<data::Message>>,
     loaded: HashSet<Thread>,
     error: Option<String>,
@@ -59,6 +62,9 @@ impl Main {
                 focus,
                 contacts: Vec::new(),
                 groups: Vec::new(),
+                avatars: HashMap::new(),
+                previews: HashMap::new(),
+                unread: HashMap::new(),
                 histories: HashMap::new(),
                 loaded: HashSet::new(),
                 error: None,
@@ -113,12 +119,14 @@ impl Main {
                     chat::Action::SendText(body) => {
                         let thread = self.panes.get(pane)?.thread()?.clone();
                         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-                        self.histories.entry(thread.clone()).or_default().push(data::Message {
+                        let message = data::Message {
                             timestamp,
                             sender: self.aci,
                             body: body.clone(),
                             status: Some(data::Status::Sending),
-                        });
+                        };
+                        self.set_preview(&thread, &message);
+                        self.histories.entry(thread.clone()).or_default().push(message);
                         Some(signal::Command::SendText {
                             thread,
                             body,
@@ -131,6 +139,7 @@ impl Main {
     }
 
     fn open_thread(&mut self, thread: Thread) -> Option<signal::Command> {
+        self.unread.remove(&thread);
         if let Some(pane) = self.panes.get_mut(self.focus) {
             *pane = Pane::chat(thread.clone());
         }
@@ -142,9 +151,27 @@ impl Main {
         self.groups = groups;
     }
 
+    pub fn avatar_loaded(&mut self, thread: Thread, bytes: Vec<u8>) {
+        self.avatars.insert(thread, image::Handle::from_bytes(bytes));
+    }
+
+    pub fn preview_loaded(&mut self, thread: Thread, message: data::Message) {
+        self.set_preview(&thread, &message);
+    }
+
+    fn set_preview(&mut self, thread: &Thread, message: &data::Message) {
+        let newer = self
+            .previews
+            .get(thread)
+            .is_none_or(|current| current.timestamp <= message.timestamp);
+        if newer {
+            self.previews.insert(thread.clone(), message.clone());
+        }
+    }
+
     pub fn history_loaded(&mut self, thread: Thread, messages: Vec<data::Message>) {
         self.loaded.insert(thread.clone());
-        let history = self.histories.entry(thread).or_default();
+        let history = self.histories.entry(thread.clone()).or_default();
         let live = std::mem::replace(history, messages);
         for message in live {
             let known = history
@@ -156,9 +183,20 @@ impl Main {
             }
         }
         history.sort_by_key(|message| message.timestamp);
+        if let Some(last) = history.last().cloned() {
+            self.set_preview(&thread, &last);
+        }
     }
 
     pub fn message_received(&mut self, thread: Thread, message: data::Message) {
+        self.set_preview(&thread, &message);
+        let visible = self
+            .panes
+            .iter()
+            .any(|(_, pane)| pane.thread() == Some(&thread));
+        if message.sender != self.aci && !visible {
+            *self.unread.entry(thread.clone()).or_default() += 1;
+        }
         self.histories.entry(thread).or_default().push(message);
     }
 
@@ -191,32 +229,55 @@ impl Main {
                 .map(|thread| self.thread_title(thread))
                 .unwrap_or_else(|| "Petunia".into());
 
-            let mut title_bar = pane_grid::TitleBar::new(text(title).size(14).height(Shrink))
-                .padding([4, 8])
-                .style(move |theme| theme::pane_title_bar(theme, focused));
+            let heading: Element<'_, Message> = match pane.thread() {
+                Some(thread) => row![
+                    avatar::view(&title, thread_accent(thread), 20.0, self.avatars.get(thread)),
+                    text(title.clone())
+                        .size(13)
+                        .font(theme::FONT_BOLD)
+                        .height(Shrink),
+                ]
+                .spacing(8)
+                .align_y(Center)
+                .into(),
+                None => text(title.clone())
+                    .size(13)
+                    .style(theme::text_dim)
+                    .height(Shrink)
+                    .into(),
+            };
+
+            let mut title_bar = pane_grid::TitleBar::new(heading).padding([8, 12]);
             if focused {
                 title_bar = title_bar
                     .controls(pane_grid::Controls::new(controls()))
                     .always_show_controls();
             }
 
-            pane_grid::Content::new(pane.view(&self.histories, self.aci, &self.contacts).map(
-                move |message| Message::Buffer(id, message),
-            ))
+            pane_grid::Content::new(
+                pane.view(&self.histories, self.aci, &self.contacts, &title)
+                    .map(move |message| Message::Buffer(id, message)),
+            )
             .title_bar(title_bar)
-            .style(move |theme| theme::pane_body(theme, focused))
+            .style(move |theme| theme::pane(theme, focused))
         })
         .on_click(Message::PaneClicked)
         .on_drag(Message::PaneDragged)
         .on_resize(8, Message::PaneResized)
-        .spacing(4);
+        .spacing(8);
 
         let content = row![
-            sidebar::view(&self.contacts, &self.groups).map(Message::OpenThread),
-            grid.width(Fill).height(Fill),
-        ]
-        .spacing(4)
-        .padding(4);
+            sidebar::view(
+                &self.contacts,
+                &self.groups,
+                &self.avatars,
+                &self.previews,
+                &self.unread,
+                self.aci,
+            )
+            .map(Message::OpenThread),
+            container(grid.width(Fill).height(Fill)).padding(8),
+        ];
 
         match &self.error {
             Some(error) => column![error_banner(error), content].into(),
@@ -239,6 +300,13 @@ impl Main {
     }
 }
 
+fn thread_accent(thread: &Thread) -> iced::Color {
+    match thread {
+        Thread::Contact(contact) => theme::accent(contact.uuid().as_bytes()),
+        Thread::Group(master_key) => theme::accent(master_key),
+    }
+}
+
 fn error_banner(error: &str) -> Element<'_, Message> {
     container(
         row![
@@ -246,7 +314,10 @@ fn error_banner(error: &str) -> Element<'_, Message> {
             button(text("×").size(13).height(Shrink))
                 .on_press(Message::DismissError)
                 .padding([0, 6])
-                .style(button::text),
+                .style(|_theme, _status| button::Style {
+                    text_color: theme::colors().on_accent,
+                    ..button::Style::default()
+                }),
         ]
         .spacing(8),
     )
@@ -261,7 +332,7 @@ fn controls<'a>() -> Element<'a, Message> {
         button(text(label).size(12).height(Shrink))
             .on_press(message)
             .padding([2, 6])
-            .style(button::text)
+            .style(theme::pane_control)
     };
 
     row![

@@ -15,6 +15,14 @@ pub enum Event {
         contacts: Vec<Contact>,
         groups: Vec<Group>,
     },
+    Avatar {
+        thread: Thread,
+        bytes: Vec<u8>,
+    },
+    Preview {
+        thread: Thread,
+        message: Message,
+    },
     History {
         thread: Thread,
         messages: Vec<Message>,
